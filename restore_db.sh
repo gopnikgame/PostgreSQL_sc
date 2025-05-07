@@ -24,8 +24,8 @@ function prompt_input() {
 
     while true; do
         if [ "$is_password" = "y" ]; then
-            read -sp "$prompt" user_input
-            echo
+            # Убрали параметр -s для отображения пароля при вводе
+            read -p "$prompt: " user_input
         else
             if [ -n "$default_value" ]; then
                 read -p "$prompt (по умолчанию: $default_value): " user_input
@@ -62,6 +62,15 @@ function run_as_sudo() {
     fi
 }
 
+# Функция проверки наличия установленного PostgreSQL
+function check_postgresql_installed() {
+    if command -v psql &> /dev/null && dpkg -l | grep postgresql &> /dev/null; then
+        return 0  # PostgreSQL установлен
+    else
+        return 1  # PostgreSQL не установлен
+    fi
+}
+
 colored_echo "yellow" "\n=== Скрипт восстановления базы данных PostgreSQL ==="
 
 # Проверка и создание директории для резервных копий
@@ -88,8 +97,8 @@ fi
 colored_echo "blue" "\nВведите параметры для восстановления БД:"
 
 prompt_input "Имя пользователя БД" DB_USER "n" "myuser"
-prompt_input "Пароль пользователя БД" DB_PASSWORD "y" "6901"
-prompt_input "Имя базы данных" DB_NAME "n" "solobot"
+prompt_input "Пароль пользователя БД" DB_PASSWORD "y" "1234"
+prompt_input "Имя базы данных" DB_NAME "n" "dbname"
 prompt_input "Имя файла резервной копии из списка выше" BACKUP_FILENAME "n"
 prompt_input "Версия PostgreSQL" PG_VERSION "n" "16"
 prompt_input "Порт PostgreSQL" PG_PORT "n" "5432"
@@ -116,15 +125,23 @@ if ! confirm_action "Продолжить с этими параметрами?"
     exit 0
 fi
 
-# Установка PostgreSQL
-if confirm_action "Установить PostgreSQL $PG_VERSION?"; then
-    colored_echo "yellow" "\nОбновление пакетов и установка PostgreSQL..."
-    run_as_sudo apt update
-    run_as_sudo apt install -y postgresql postgresql-contrib
-    
-    # Проверка успешности установки
-    if [ $? -ne 0 ]; then
-        colored_echo "red" "Ошибка при установке PostgreSQL"
+# Проверка наличия PostgreSQL и его установка при необходимости
+if check_postgresql_installed; then
+    colored_echo "green" "PostgreSQL уже установлен в системе"
+else
+    colored_echo "yellow" "PostgreSQL не обнаружен в системе"
+    if confirm_action "Установить PostgreSQL $PG_VERSION?"; then
+        colored_echo "yellow" "\nОбновление пакетов и установка PostgreSQL..."
+        run_as_sudo apt update
+        run_as_sudo apt install -y postgresql postgresql-contrib
+        
+        # Проверка успешности установки
+        if [ $? -ne 0 ]; then
+            colored_echo "red" "Ошибка при установке PostgreSQL"
+            exit 1
+        fi
+    else
+        colored_echo "red" "PostgreSQL необходим для восстановления базы данных"
         exit 1
     fi
 fi
@@ -198,26 +215,37 @@ colored_echo "yellow" "\nВосстановление базы данных из
 if confirm_action "Выполнить восстановление базы $DB_NAME из файла $BACKUP_FILE?"; then
     colored_echo "yellow" "Процесс восстановления может занять некоторое время..."
     
+    # Копируем файл резервной копии во временный каталог с правильными разрешениями
+    colored_echo "yellow" "Копирование файла бекапа во временную директорию..."
+    TMP_BACKUP="/tmp/$(basename "$BACKUP_FILE")"
+    cp "$BACKUP_FILE" "$TMP_BACKUP"
+    chmod 644 "$TMP_BACKUP"
+    chown postgres:postgres "$TMP_BACKUP"
+    
     # Проверяем тип файла (текстовый дамп или бинарный)
-    if file "$BACKUP_FILE" | grep -q "text" || head -n 1 "$BACKUP_FILE" | grep -q "PostgreSQL database dump"; then
+    if file "$TMP_BACKUP" | grep -q "text" || head -n 1 "$TMP_BACKUP" | grep -q "PostgreSQL database dump"; then
         # Текстовый дамп
         colored_echo "yellow" "Обнаружен текстовый дамп SQL, используем psql..."
         export PGPASSWORD="$DB_PASSWORD"
-        sudo -u postgres psql -d "$DB_NAME" -f "$BACKUP_FILE" 2>/tmp/pg_restore_error.log
+        sudo -u postgres psql -d "$DB_NAME" -f "$TMP_BACKUP" 2>/tmp/pg_restore_error.log
         restore_result=$?
     else
         # Бинарный дамп
         colored_echo "yellow" "Обнаружен бинарный дамп, используем pg_restore..."
         export PGPASSWORD="$DB_PASSWORD"
-        sudo -u postgres pg_restore -d "$DB_NAME" "$BACKUP_FILE" 2>/tmp/pg_restore_error.log
+        sudo -u postgres pg_restore -d "$DB_NAME" "$TMP_BACKUP" 2>/tmp/pg_restore_error.log
         restore_result=$?
     fi
+    
+    # Удаляем временный файл
+    rm -f "$TMP_BACKUP"
 
     if [ $restore_result -eq 0 ]; then
         colored_echo "green" "\nБаза данных успешно восстановлена из бекапа $BACKUP_FILE"
     else
         colored_echo "red" "\nОшибка при восстановлении базы данных"
         colored_echo "yellow" "Подробности ошибки можно посмотреть в файле /tmp/pg_restore_error.log"
+        cat /tmp/pg_restore_error.log
         exit 1
     fi
 fi
