@@ -53,13 +53,36 @@ function confirm_action() {
     [[ $REPLY =~ ^[Yy]$ ]]
 }
 
-# Проверка на root
-if [ "$(id -u)" -ne 0 ]; then
-    colored_echo "red" "Этот скрипт должен запускаться с правами root"
-    exit 1
-fi
+# Функция для запуска команд с sudo, если текущий пользователь не root
+function run_as_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
 
 colored_echo "yellow" "\n=== Скрипт восстановления базы данных PostgreSQL ==="
+
+# Проверка и создание директории для резервных копий
+BACKUP_DIR="$HOME/backup"
+if [ ! -d "$BACKUP_DIR" ]; then
+    colored_echo "yellow" "Директория для резервных копий не найдена. Создаем $BACKUP_DIR..."
+    mkdir -p "$BACKUP_DIR"
+    colored_echo "green" "Директория $BACKUP_DIR успешно создана."
+    colored_echo "yellow" "Пожалуйста, поместите файл резервной копии в директорию $BACKUP_DIR и запустите скрипт снова."
+    exit 0
+else
+    # Получение списка файлов в директории бэкапа
+    BACKUP_FILES=$(ls -1 "$BACKUP_DIR" 2>/dev/null)
+    if [ -z "$BACKUP_FILES" ]; then
+        colored_echo "red" "Директория $BACKUP_DIR пуста. Пожалуйста, поместите файл резервной копии в директорию и запустите скрипт снова."
+        exit 0
+    fi
+    
+    colored_echo "green" "Найдены следующие файлы резервных копий:"
+    ls -1 "$BACKUP_DIR" | nl
+fi
 
 # Получение параметров от пользователя
 colored_echo "blue" "\nВведите параметры для восстановления БД:"
@@ -67,15 +90,26 @@ colored_echo "blue" "\nВведите параметры для восстано
 prompt_input "Имя пользователя БД" DB_USER "n" "myuser"
 prompt_input "Пароль пользователя БД" DB_PASSWORD "y" "6901"
 prompt_input "Имя базы данных" DB_NAME "n" "solobot"
-prompt_input "Полный путь к файлу бекапа" BACKUP_FILE "n"
+prompt_input "Имя файла резервной копии из списка выше" BACKUP_FILENAME "n"
 prompt_input "Версия PostgreSQL" PG_VERSION "n" "16"
+prompt_input "Порт PostgreSQL" PG_PORT "n" "5432"
+
+# Формируем полный путь к файлу бекапа
+BACKUP_FILE="$BACKUP_DIR/$BACKUP_FILENAME"
+
+# Проверка существования файла бекапа
+if [ ! -f "$BACKUP_FILE" ]; then
+    colored_echo "red" "Ошибка: файл бекапа $BACKUP_FILE не найден"
+    exit 1
+fi
 
 # Вывод сводки
 colored_echo "green" "\n=== Параметры восстановления ==="
 colored_echo "yellow" "Пользователь БД: $DB_USER"
 colored_echo "yellow" "База данных: $DB_NAME"
 colored_echo "yellow" "Файл бекапа: $BACKUP_FILE"
-colored_echo "yellow" "Версия PostgreSQL: $PG_VERSION\n"
+colored_echo "yellow" "Версия PostgreSQL: $PG_VERSION"
+colored_echo "yellow" "Порт PostgreSQL: $PG_PORT\n"
 
 if ! confirm_action "Продолжить с этими параметрами?"; then
     colored_echo "red" "Восстановление отменено пользователем"
@@ -85,14 +119,20 @@ fi
 # Установка PostgreSQL
 if confirm_action "Установить PostgreSQL $PG_VERSION?"; then
     colored_echo "yellow" "\nОбновление пакетов и установка PostgreSQL..."
-    apt update
-    apt install -y postgresql postgresql-contrib
+    run_as_sudo apt update
+    run_as_sudo apt install -y postgresql postgresql-contrib
+    
+    # Проверка успешности установки
+    if [ $? -ne 0 ]; then
+        colored_echo "red" "Ошибка при установке PostgreSQL"
+        exit 1
+    fi
 fi
 
 # Запуск службы PostgreSQL
 colored_echo "yellow" "\nЗапуск PostgreSQL..."
-systemctl start postgresql
-systemctl enable postgresql
+run_as_sudo systemctl start postgresql
+run_as_sudo systemctl enable postgresql
 
 # Проверка статуса
 PG_STATUS=$(systemctl is-active postgresql)
@@ -112,6 +152,12 @@ else
     sudo -u postgres psql -c "CREATE USER $DB_USER WITH NOCREATEDB NOCREATEROLE NOSUPERUSER PASSWORD '$DB_PASSWORD';"
 fi
 
+# Проверка успешности создания пользователя
+if [ $? -ne 0 ]; then
+    colored_echo "red" "Ошибка при создании/обновлении пользователя БД"
+    exit 1
+fi
+
 if sudo -u postgres psql -lqt | cut -d \| -f 1 | grep -qw "$DB_NAME"; then
     colored_echo "yellow" "База данных $DB_NAME уже существует"
     if confirm_action "Удалить существующую базу данных $DB_NAME и создать заново?"; then
@@ -122,12 +168,18 @@ else
     sudo -u postgres createdb "$DB_NAME" --owner="$DB_USER"
 fi
 
+# Проверка успешности создания БД
+if [ $? -ne 0 ]; then
+    colored_echo "red" "Ошибка при создании базы данных"
+    exit 1
+fi
+
 # Изменение метода аутентификации
 colored_echo "yellow" "\nНастройка аутентификации..."
 PG_HBA_FILE="/etc/postgresql/$PG_VERSION/main/pg_hba.conf"
 if [ -f "$PG_HBA_FILE" ]; then
     if grep -q "local   all    all           peer" "$PG_HBA_FILE"; then
-        sed -i 's/local   all    all           peer/local   all    all           md5/' "$PG_HBA_FILE"
+        run_as_sudo sed -i 's/local   all    all           peer/local   all    all           md5/' "$PG_HBA_FILE"
         colored_echo "green" "Файл $PG_HBA_FILE успешно изменен"
     else
         colored_echo "yellow" "Метод аутентификации уже настроен"
@@ -139,13 +191,7 @@ fi
 
 # Перезагрузка PostgreSQL
 colored_echo "yellow" "\nПерезагрузка PostgreSQL..."
-systemctl restart postgresql
-
-# Проверка существования файла бекапа
-if [ ! -f "$BACKUP_FILE" ]; then
-    colored_echo "red" "Ошибка: файл бекапа $BACKUP_FILE не найден"
-    exit 1
-fi
+run_as_sudo systemctl restart postgresql
 
 # Восстановление базы данных из бекапа
 colored_echo "yellow" "\nВосстановление базы данных из бекапа..."
@@ -153,26 +199,38 @@ if confirm_action "Выполнить восстановление базы $DB_
     colored_echo "yellow" "Процесс восстановления может занять некоторое время..."
     
     # Проверяем тип файла (текстовый дамп или бинарный)
-    if grep -q "PostgreSQL database dump" "$BACKUP_FILE"; then
+    if file "$BACKUP_FILE" | grep -q "text" || head -n 1 "$BACKUP_FILE" | grep -q "PostgreSQL database dump"; then
         # Текстовый дамп
         colored_echo "yellow" "Обнаружен текстовый дамп SQL, используем psql..."
-        sudo -u postgres psql -U "$DB_USER" -d "$DB_NAME" -f "$BACKUP_FILE"
+        export PGPASSWORD="$DB_PASSWORD"
+        sudo -u postgres psql -d "$DB_NAME" -f "$BACKUP_FILE" 2>/tmp/pg_restore_error.log
+        restore_result=$?
     else
         # Бинарный дамп
         colored_echo "yellow" "Обнаружен бинарный дамп, используем pg_restore..."
-        sudo -u postgres pg_restore -U "$DB_USER" -d "$DB_NAME" "$BACKUP_FILE"
+        export PGPASSWORD="$DB_PASSWORD"
+        sudo -u postgres pg_restore -d "$DB_NAME" "$BACKUP_FILE" 2>/tmp/pg_restore_error.log
+        restore_result=$?
     fi
 
-    if [ $? -eq 0 ]; then
+    if [ $restore_result -eq 0 ]; then
         colored_echo "green" "\nБаза данных успешно восстановлена из бекапа $BACKUP_FILE"
     else
         colored_echo "red" "\nОшибка при восстановлении базы данных"
+        colored_echo "yellow" "Подробности ошибки можно посмотреть в файле /tmp/pg_restore_error.log"
         exit 1
     fi
 fi
 
+# Формируем URL для подключения к базе
+PG_HOST="localhost"
+DATABASE_URL="postgresql://$DB_USER:$DB_PASSWORD@$PG_HOST:$PG_PORT/$DB_NAME"
+
 colored_echo "green" "\n=== Процесс завершен успешно ==="
-colored_echo "yellow" "Проверьте подключение к базе данных с параметрами:"
-colored_echo "yellow" "Пользователь: $DB_USER"
-colored_echo "yellow" "База данных: $DB_NAME"
-colored_echo "yellow" "Пароль: $DB_PASSWORD"
+colored_echo "yellow" "Данные для подключения к базе данных:"
+colored_echo "green" "DB_NAME = \"$DB_NAME\" # Имя базы данных"
+colored_echo "green" "DB_USER = \"$DB_USER\" # Логин пользователя"
+colored_echo "green" "DB_PASSWORD = \"$DB_PASSWORD\" # Пароль пользователя"
+colored_echo "green" "PG_HOST = \"$PG_HOST\"  # Адрес сервера postgresql"
+colored_echo "green" "PG_PORT = \"$PG_PORT\"  # Порт сервера postgresql"
+colored_echo "green" "DATABASE_URL = \"$DATABASE_URL\""
